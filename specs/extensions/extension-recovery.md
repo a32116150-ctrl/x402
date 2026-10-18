@@ -1,0 +1,297 @@
+# Recovery Extension
+
+**1. Overview**
+
+The Recovery Extension adds two guarantees to x402 that today live only in the imagination of
+caller-side retry logic:
+
+1. **Evidence bundle**: every paid response carries re-checkable hashes — of the canonical
+   request and of the response body under a declared *projection* (a fixed set of keys that
+   MUST be excluded before hashing).
+2. **Settled-response recovery**: if a caller paid and the response was lost in transport,
+   a retry with the same idempotency key returns the SAME verdict, free of a second charge —
+   and the extension mandates the safety property that makes this honest:
+
+   > **Replayable recovery records MUST be gated on confirmed settlement.** A failed, aborted,
+   > or pending settlement MUST never leave a replayable free result (fail-closed).
+
+This extension supports downstream use cases including:
+
+- elimination of double-charges for network-loss retries (the common agent failure mode),
+- auditors recomputing exactly what the service claims, without trusting its word,
+- dispute evidence: the hashes bind an answer to a request and a block, on or off chain.
+
+The artifacts are **x402 version-agnostic**: they are plain JSON in the settlement response
+body (v1 pattern) or placed in `extensions` (v2 pattern); the header used for the key is
+declarable. No new cryptography is introduced — the extension standardizes behavior that a
+responsible service must implement anyway, so callers can *detect* its presence instead of
+guessing.
+
+**2. Status, Evolution, and Forward Compatibility**
+
+This extension is specified as an optional, composable addition to x402. It introduces no
+new transport fields inside `accepts[]` payment terms and does not alter settlement itself.
+
+- **Wire shape and field placement are not considered stable** and may change to align with
+  x402 canonical extension architecture.
+- **Behavioral requirements are stable**: the projection recipe, the settlement-gating rule,
+  the replay semantics, and the tombstone signal in this document are normative.
+
+**3. Extension Declaration**
+
+A server that implements this extension declares it in the `extensions` field of the
+payment requirements response:
+
+```
+extensions["recovery"].info
+```
+
+| Field                  | Type     | Required | Description                                                          |
+| ---------------------- | -------- | -------- | -------------------------------------------------------------------- |
+| `header`               | string   | No       | Request header carrying the caller's operation key. Default `"x-idempotency-key"`. Support for the conventional `idempotency-key` fallback is RECOMMENDED. |
+| `ttlSeconds`           | number   | Yes      | Replay window length, measured from settlement confirmation.          |
+| `maxReplays`           | number   | Yes      | Maximum free replays per operation.                                   |
+| `stageTimeoutSeconds`  | number   | No       | Maximum time an unconfirmed (staged) record may exist before it is silently discarded. Aged staged records MUST NOT leave tombstones. |
+| `excludedKeys`         | string[] | Yes      | Body keys excluded from the response projection before hashing.       |
+| `contentCompanion`     | boolean  | No       | Whether the server also records verdicts under a canonical-request-content companion key. See §3.2. |
+| `reference`            | string   | No       | URL of an implementation's recovery contract documentation.           |
+
+Example (x402 v2):
+
+```json
+{
+  "extensions": {
+    "recovery": {
+      "info": {
+        "header": "x-idempotency-key",
+        "ttlSeconds": 600,
+        "maxReplays": 3,
+        "stageTimeoutSeconds": 300,
+        "excludedKeys": ["recovery", "evidence_bundle", "cache", "elapsedMs"],
+        "contentCompanion": true,
+        "reference": "https://example.com/recovery"
+      },
+      "schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "header": { "type": "string" },
+          "ttlSeconds": { "type": "integer" },
+          "maxReplays": { "type": "integer" },
+          "stageTimeoutSeconds": { "type": "integer" },
+          "excludedKeys": { "type": "array", "items": { "type": "string" } },
+          "contentCompanion": { "type": "boolean" },
+          "reference": { "type": "string" }
+        },
+        "required": ["ttlSeconds", "maxReplays", "excludedKeys"]
+      }
+    }
+  }
+}
+```
+
+**3.1 Callers: one key per operation**
+
+Callers SHOULD send the declared header on the FIRST call of an operation and reuse the SAME
+value on retries of that operation. A caller that mints a fresh id per retry loses protection
+unless the server also implements the content companion (§3.2).
+
+The idempotency key is the **caller's secret**: whoever presents it can replay the verdict
+free within the window. Callers MUST NOT log it publicly. Callers SHOULD prefer presenting
+it only to the service that issued the protected resource.
+
+**3.2 Content companion (optional, with a stated caveat)**
+
+If `contentCompanion` is declared, the server additionally records the verdict under a
+companion key derived from the canonical request content, so a retry that cannot reuse the
+caller's id (fresh id per retry, process restart) still replays free inside the window.
+Two different asks that canonicalize identically share one verdict — this is determinism,
+not cache leakage.
+
+Caveat, made part of the spec rather than a footnote: **content companion is cache
+semantics**. A content-keyed tombstone proves that a verdict once existed; it does not
+prove that THIS caller paid for it. Implementations supporting the companion MUST share ONE
+replay budget across all aliases of an operation (the cap is per operation, not per alias).
+
+**4. Evidence Bundle**
+
+Every paid response of a protected resource implementing this extension carries:
+
+```json
+{
+  "evidence_bundle": {
+    "spec": "<implementation>/<bundle>@<version>",
+    "route": "/example",
+    "requestHash": "<sha256 hex>",
+    "responseHash": "<sha256 hex>",
+    "pinnedBlock": 26220878,
+    "mode": "testnet",
+    "createdAt": "2026-10-18T17:00:00.000Z",
+    "payment": { "protocol": "x402", "scheme": "exact" },
+    "recompute": "<one-sentence recipe>"
+  }
+}
+```
+
+- `requestHash` covers the canonical form of `{ route, body }`.
+- `responseHash` covers the canonical form of the response body with **every key listed in
+  `excludedKeys` removed**, recursively sorted keys, no whitespace. The exclusion set is
+  fixed per route by the declaration. Transport-volatile fields (timing, block cache
+  markers) and the bundle/recovery envelopes MUST be in the exclusion set.
+- The recipe sentence in `recompute` MUST describe exactly this procedure so a receiver can
+  recompute both hashes without reading source code.
+
+The projection MUST be identical across: the first paid response, any free replay, and any
+internal record keeping. One projection, one number everywhere. Evidence-bundle fields other
+than the hashes are informational.
+
+**5. Recovery Semantics (Normative)**
+
+**5.1 Stage-then-promote**
+
+When a paid request computes a result and the caller supplied a key:
+
+- the server MAY stage the result immediately for recovery;
+- the result MUST NOT become replayable until **settlement confirmation** — the point at
+  which the payment rail (facilitator or chain view) reports the settle as successful and
+  the response bytes are final;
+- promotion MUST be verified against the SAME projection hash of the bytes actually
+  transmittable to the caller. Implementations SHOULD use the settlement lifecycle hook of
+  their framework for this (for the reference Express implementation: register an
+  `onAfterSettle` handler that promotes staged records matched by projection hash of
+  `transportContext.responseBody`).
+
+The following are normative consequences:
+
+1. **Failed or pending settlement promotes nothing.** A 402 outcome from settle failure
+   leaves staged state that cannot serve a free replay. A keyed retry after a failed
+   settlement hits the payment wall again; it does not receive the still-computed verdict
+   for free.
+2. **Settle-cancellation promotes nothing.** Handler failures and after-verify cancellations
+   are the same class.
+3. **Staged records are inert and age out silently.** A staged record that is never
+   promoted MUST be discarded after `stageTimeoutSeconds` and MUST NOT leave a tombstone:
+   an unsettled verdict is not a lost verdict, so no typed signal is owed.
+4. **Save-failure policy is fail-closed.** If the promotion step itself errors, the entry
+   stays staged. Implementations SHOULD log the error; they MUST NOT silently promote.
+
+**5.2 Replay**
+
+If a request presents the key (or a companion alias, when enabled) of an operation whose
+record is (a) promoted, (b) within `ttlSeconds` of its settlement, and (c) under
+`maxReplays`, the server returns the recorded response **without requiring payment** and
+MUST append:
+
+```json
+{
+  "recovery": {
+    "replayed": true,
+    "responseHash": "<sha256 hex>",
+    "replays": 2,
+    "ttlMinutes": 10,
+    "maxReplays": 3
+  }
+}
+```
+
+`replays` counts replays of the operation, shared across aliases when companions are enabled.
+The replayed body MUST hash to `recovery.responseHash` under the declared projection.
+
+**5.3 After the window (typed, not silent)**
+
+When the window closes, the promoted record is removed and the server MAY keep a
+**tombstone**: `{ responseHash, settledAt, expiredAt }` for a server-defined retention
+period. A retry within the tombstone window re-measures with the payment wall re-armed
+(there is no free measure — anything else would be a loophole) and the response carries:
+
+```json
+{
+  "recovery": {
+    "remeasured": true,
+    "previousResponseHash": "<sha256 hex>",
+    "expiredAt": "2026-10-18T18:00:00.000Z"
+  }
+}
+```
+
+so calling agents can branch on "this exact operation was charged before and its replay
+window expired" instead of guessing. A fresh settlement of the same operation clears the
+tombstone and re-opens the window. Tombstones themselves expire.
+
+**6. Protocol Integration**
+
+The extension is transport-neutral. Normative behavior lives in the response body and the
+request header, which makes it identical for x402 v1 responses and v2 responses.
+
+For x402 v1 (body-level), a settlement response looks like:
+
+```json
+{
+  "verdict": "no_edge",
+  "netBps": -36.11,
+  "evidence_bundle": { "...": "..." },
+  "recovery": { "replayed": false }
+}
+```
+
+For x402 v2, implementations MAY surface the same structures in the response body and MAY
+additionally mirror declaration metadata into `extensions["recovery"]` as in §3. The v2
+extension placement uses `info` and `schema` following existing extension conventions.
+
+**7. Key Discovery and Trust**
+
+No trust system is mandated beyond the settlement itself: the recovery guarantee is
+anchored in the fact that the operation's verdict only becomes free replayable through
+the operation's own settlement confirmation. The content companion inherits the sandbox of
+the same promotion rule; it cannot promote records whose projection does not match the
+bytes of a successfully settled response.
+
+**8. Use Cases (Non-Normative)**
+
+- **Agent retry loops**: an agent that timed out after paying calls again with the same
+  idempotency key and gets the answer, not a second charge — without the caller of the agent
+  needing to keep a ledger.
+- **Audited measurements**: a downstream consumer recomputes `requestHash`/`responseHash`
+  from the body to prove the artifact they quote was really produced by the service for
+  that request.
+- **Dispute and reputation evidence**: hashes plus pinned block give attestation systems a
+  minimal, portable payload — the same artifacts can be lifted into external proof formats
+  verbatim.
+
+**9. Integration with Proof Systems**
+
+Both the evidence bundle and the recovery envelope are self-contained JSON objects and can
+be lifted verbatim into signatures or attestations (see the Offer and Receipt extension for
+signature formats). This extension does not sign anything itself; it makes the artifacts
+that CAN be signed well-defined.
+
+**10. Security Considerations**
+
+- The settlement-gating rule (§5.1) exists precisely because the naive implementation
+  (record in the route handler, settle afterwards) has been shown to reproduce: a failed
+  settlement with records promoted by the handler leaves free replayable output. An
+  independent review of a live deployment surfaced this and the fix is what §5.1 codifies.
+- Promotion by projection hash of the actual response bytes prevents staged-but-unsettled
+  records from being trivially poisoned, and also bounds damage from content-identical
+  collisions: content-identical asks are one measurement by construction.
+- The replay key is a bearer secret; implementations SHOULD keep the window short and
+  bounded so the 402 paywall remains effective.
+- Hash projection choice is part of the contract: ambiguous projections (different sets of
+  excluded fields in different places) make advertised hashes unrecomputable. This
+  extension requires the exclusion set to be declared once and used identically everywhere
+  (§4).
+- Clock: TTL is measured from settlement confirmation, not from handler execution.
+
+**11. Privacy Considerations**
+
+- The recovery key binds to an operation, not to a person; the extension fixes no identity
+  claim. Services SHOULD NOT add caller identity to artifacts without their own consent
+  story.
+- Tombstones reveal that "this request shape was measured before" — a bounded window keeps
+  the information coarse.
+
+**12. Version History**
+
+| Version | Date       | Changes                                            | Author                          |
+| ------- | ---------- | -------------------------------------------------- | ------------------------------- |
+| 0.1     | 2026-10-18 | Initial draft. Extracted from a live x402 service (verify402.onrender.com, reference implementation open-source) and hardened after independent reproduction of two defects by an external agent (SameDayDesk): recovery-before-settlement and projection mismatch. | a32116150-ctrl (verify402) |
