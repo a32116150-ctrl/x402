@@ -211,6 +211,17 @@ The following are normative consequences:
 5. **Save-failure policy is fail-closed.** If the promotion step itself errors, the entry
    stays staged. Implementations SHOULD log the error; they MUST NOT silently promote.
 
+> **Two mechanisms satisfy §5.1; the architecture chooses.** The stage-then-promote pattern
+> above is required when settlement confirmation is *asynchronous* — it can only arrive via a
+> lifecycle hook after the response has already been built. Where settlement confirmation is
+> *synchronous* with response construction (a runtime that settles inline before headers are
+> sent), a strictly simpler mechanism satisfies the same rule with no intermediate state:
+> never write the recovery record speculatively — write it only past two gates, a confirmed
+> settlement *and* a delivered (sub-3xx) response. That yields no staged record, no
+> `stageTimeoutSeconds`, and no promotion-hook-failure case; fail-closed falls out of "don't
+> write until the outcome is already known." Implementations SHOULD state which mechanism they
+> use. (Production corroboration: scvd.store, `x402-foundation/x402#3847`.)
+
 **5.2 Replay and conflict**
 
 If a request presents the key (or a companion alias, when enabled) of an operation whose
@@ -381,3 +392,4 @@ that CAN be signed well-defined.
 | ------- | ---------- | -------------------------------------------------- | ------------------------------- |
 | 0.1     | 2026-10-18 | Initial draft. Extracted from a live x402 service (verify402.onrender.com, reference implementation open-source) and hardened after independent reproduction of two defects by an external agent (SameDayDesk): recovery-before-settlement and projection mismatch. | a32116150-ctrl (verify402) |
 | 0.2     | 2026-10-19 | Addresses review by NSPG13 (x402-foundation/x402#3848, at `d97ebfa3`). Promotion now keys on a server-generated operation identity plus a confirmed settlement reference, with the projection hash as an additional check (§5.1) — output equality alone no longer identifies an operation. Added key/scope conflict semantics resolved before payment or replay (§5.2), scoped the content companion so equal content is not permission (§3.2, §7), and added a required self-test control set including the identical-output cross-promotion case (§5.4). | a32116150-ctrl (verify402) |
+| 0.3     | 2026-10-19 | Names both mechanisms that satisfy §5.1 — async stage-then-promote and synchronous write-after-settle — since the choice is determined by whether settlement confirmation can complete before the response is built. Prompted by production corroboration from scvd.store on x402-foundation/x402#3847 (request-identity keying, scope-bound cache keys, no speculative write). | a32116150-ctrl (verify402) |
