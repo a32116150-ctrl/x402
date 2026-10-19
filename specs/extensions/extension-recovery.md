@@ -100,7 +100,14 @@ The idempotency key is the **caller's secret**: whoever presents it can replay t
 free within the window. Callers MUST NOT log it publicly. Callers SHOULD prefer presenting
 it only to the service that issued the protected resource.
 
-**3.2 Content companion (optional, with a stated caveat)**
+A key is bound to ONE operation: the canonical request fingerprint plus, where the rail
+exposes it, the payer's authorization scope. Spectators cannot recover another caller's
+result by guessing a key, and the key cannot be replayed across a different payer (see §5.2).
+Response bodies that participate in recovery additionally carry a server-generated
+`operationId` under an excluded key (the reference implementation uses `recovery.operationId`)
+so the settlement hook can promote the exact operation whose payment settled (§5.1).
+
+**3.2 Content companion (optional, with stated limits)**
 
 If `contentCompanion` is declared, the server additionally records the verdict under a
 companion key derived from the canonical request content, so a retry that cannot reuse the
@@ -108,10 +115,24 @@ caller's id (fresh id per retry, process restart) still replays free inside the 
 Two different asks that canonicalize identically share one verdict — this is determinism,
 not cache leakage.
 
-Caveat, made part of the spec rather than a footnote: **content companion is cache
-semantics**. A content-keyed tombstone proves that a verdict once existed; it does not
-prove that THIS caller paid for it. Implementations supporting the companion MUST share ONE
-replay budget across all aliases of an operation (the cap is per operation, not per alias).
+Limits, made part of the spec rather than a footnote:
+
+- **Equal content is not permission.** The companion is a recovery alias for the SAME
+  operation and the SAME authorization scope, never a public cache. A server MUST NOT return
+  a companion hit to a caller whose authorization scope does not match the scope recorded at
+  staging (when the payment rail exposes a payer identity). Presenting a body that
+  canonicalizes to the same bytes does not establish the right to see another caller's
+  result.
+- **One replay budget per operation.** Implementations supporting the companion MUST share
+  ONE replay budget across all aliases of an operation (the cap is per operation, not per
+  alias).
+- **Bound to the operation identity.** A companion alias is only promotable through the same
+  settlement gating as the primary key (§5.1): the operation's own settlement, matched by
+  operation identity, never by content bytes alone.
+
+The companion MAY additionally record a **content-keyed tombstone** to signal that a verdict
+once existed. Such a tombstone proves only that a verdict existed; it MUST NOT be treated as
+evidence that THIS caller paid for it, and it MUST NOT unlock any replay.
 
 **4. Evidence Bundle**
 
@@ -152,30 +173,45 @@ than the hashes are informational.
 When a paid request computes a result and the caller supplied a key:
 
 - the server MAY stage the result immediately for recovery;
+- every operation MUST receive a **server-generated, unguessable operation identity**
+  (`operationId`). It MUST be carried in the response body under a key that is itself in the
+  projection exclusion set (the reference implementation uses `recovery.operationId`), so it
+  never perturbs the response hash;
 - the result MUST NOT become replayable until **settlement confirmation** — the point at
   which the payment rail (facilitator or chain view) reports the settle as successful and
   the response bytes are final;
-- promotion MUST be verified against the SAME projection hash of the bytes actually
-  transmittable to the caller. Implementations SHOULD use the settlement lifecycle hook of
-  their framework for this (for the reference Express implementation: register an
-  `onAfterSettle` handler that promotes staged records matched by projection hash of
-  `transportContext.responseBody`).
+- promotion MUST be keyed on the operation identity, MUST require a confirmed settlement
+  carrying a **settlement reference** (a transaction identifier), and MUST additionally
+  verify that the projection hash of the bytes transmittable to the caller still matches the
+  staged record. Implementations SHOULD use the settlement lifecycle hook of their framework
+  for this (for the reference Express implementation: register an `onAfterSettle` handler
+  that passes `transportContext.responseBody` plus the settle result to the promotion step).
+
+> **Output equality does not identify an operation.** The projection hash is an additional
+> integrity check, never the primary key. Two distinct operations can legitimately produce
+> byte-identical output (e.g. two requests that both resolve to `{"verdict":"no_match"}`);
+> settling one MUST NOT promote the other.
 
 The following are normative consequences:
 
 1. **Failed or pending settlement promotes nothing.** A 402 outcome from settle failure
    leaves staged state that cannot serve a free replay. A keyed retry after a failed
    settlement hits the payment wall again; it does not receive the still-computed verdict
-   for free.
+   for free. Promotion MUST be refused unless the settle result reports success AND carries
+   a non-empty settlement reference.
 2. **Settle-cancellation promotes nothing.** Handler failures and after-verify cancellations
    are the same class.
-3. **Staged records are inert and age out silently.** A staged record that is never
+3. **Authorization scope is part of the operation.** If the payment rail exposes a payer
+   identity at staging time, promotion MUST refuse a settlement whose payer does not match
+   the recorded scope. An unknown scope may still PAY; it may never replay or promote on
+   behalf of a known one.
+4. **Staged records are inert and age out silently.** A staged record that is never
    promoted MUST be discarded after `stageTimeoutSeconds` and MUST NOT leave a tombstone:
    an unsettled verdict is not a lost verdict, so no typed signal is owed.
-4. **Save-failure policy is fail-closed.** If the promotion step itself errors, the entry
+5. **Save-failure policy is fail-closed.** If the promotion step itself errors, the entry
    stays staged. Implementations SHOULD log the error; they MUST NOT silently promote.
 
-**5.2 Replay**
+**5.2 Replay and conflict**
 
 If a request presents the key (or a companion alias, when enabled) of an operation whose
 record is (a) promoted, (b) within `ttlSeconds` of its settlement, and (c) under
@@ -197,6 +233,23 @@ MUST append:
 `replays` counts replays of the operation, shared across aliases when companions are enabled.
 The replayed body MUST hash to `recovery.responseHash` under the declared projection.
 
+**Conflict: a key is bound to one operation.** Because a key identifies an operation, not a
+slot in a cache, reusing it for a *different* operation is an error, not a hit:
+
+- If a key arrives with **changed request content** (the canonical request fingerprint
+  differs from the one recorded), the server MUST reject the request before payment and
+  before replay — it MUST NOT return the other operation's verdict and MUST NOT charge.
+- If the same key arrives under a **different authorization scope** (a different payer
+  identity on a rail that exposes one), the server MUST likewise reject before payment and
+  before replay.
+- The rejection SHOULD be a typed `4xx` (the reference implementation uses `409` with
+  `error: "recovery_conflict"` and a machine-readable `conflict` field such as
+  `request_mismatch` or `scope_mismatch`). A caller that encounters a conflict either
+  chooses a new key for the new operation or is charged normally for the fresh call.
+
+A key whose recorded request fingerprint and scope both match the incoming request is
+recoverable exactly as in the first paragraph.
+
 **5.3 After the window (typed, not silent)**
 
 When the window closes, the promoted record is removed and the server MAY keep a
@@ -217,6 +270,30 @@ period. A retry within the tombstone window re-measures with the payment wall re
 so calling agents can branch on "this exact operation was charged before and its replay
 window expired" instead of guessing. A fresh settlement of the same operation clears the
 tombstone and re-opens the window. Tombstones themselves expire.
+
+**5.4 Conformance controls (implementation self-test)**
+
+An implementation claiming this extension SHOULD maintain the offline controls below. They
+are deterministic, need no live facilitator, and each one pins a rule that a plausible-
+looking but incorrect implementation silently violates:
+
+1. **Identical output does not cross-promote.** Stage two operations whose projections are
+   byte-identical (`{"verdict":"no_match"}` twice). Confirm settlement of A only. A MUST be
+   replayable; B MUST remain inert. Promoting by response bytes alone fails this control.
+2. **Settlement reference required.** Promotion of a staged record MUST return "not promoted"
+   for each of: `{ ok: false }`, a missing settlement reference, and an empty settlement
+   reference. A confirmed settlement with a reference MUST promote.
+3. **Operation identity required.** A response body that does not name `operationId` MUST NOT
+   promote, even when accompanied by a valid settlement.
+4. **Key + changed content conflicts.** A key recorded for request R1, presented with request
+   R2, MUST yield a typed conflict — not R1's verdict, not a charge.
+5. **Key + changed scope conflicts.** A key recorded for payer P1, presented with payer P2,
+   MUST yield a typed conflict.
+6. **Payer must match on promotion.** A settlement whose payer differs from the staged scope
+   MUST NOT promote.
+7. **Companion requires scope.** A companion alias MUST NOT be returned to a caller with no
+   declared scope, or a mismatched one — equal content alone is never permission — and MUST
+   be returned to a caller whose scope matches.
 
 **6. Protocol Integration**
 
@@ -241,10 +318,13 @@ extension placement uses `info` and `schema` following existing extension conven
 **7. Key Discovery and Trust**
 
 No trust system is mandated beyond the settlement itself: the recovery guarantee is
-anchored in the fact that the operation's verdict only becomes free replayable through
-the operation's own settlement confirmation. The content companion inherits the sandbox of
-the same promotion rule; it cannot promote records whose projection does not match the
-bytes of a successfully settled response.
+anchored in the fact that an operation's verdict only becomes free-replayable through **that
+operation's own settlement confirmation**, matched by the operation identity the server
+generated and by the settlement reference the rail returned. The projection hash is an
+additional integrity check, not the identity. The content companion inherits the sandbox of
+the same promotion rule and the same authorization scope: it cannot promote records whose
+projection does not match a successfully settled response, and it cannot hand a result to a
+caller whose scope does not match.
 
 **8. Use Cases (Non-Normative)**
 
@@ -271,9 +351,14 @@ that CAN be signed well-defined.
   (record in the route handler, settle afterwards) has been shown to reproduce: a failed
   settlement with records promoted by the handler leaves free replayable output. An
   independent review of a live deployment surfaced this and the fix is what §5.1 codifies.
-- Promotion by projection hash of the actual response bytes prevents staged-but-unsettled
-  records from being trivially poisoned, and also bounds damage from content-identical
-  collisions: content-identical asks are one measurement by construction.
+- Promotion keyed on the operation identity — not the projection hash — closes the
+  cross-promotion hole: two operations with identical output are still distinct, so settling
+  one cannot unlock the other. The projection hash remains as a second check against
+  staged-but-unsettled poisoning, and bounds damage from content-identical collisions:
+  content-identical asks are one measurement by construction.
+- The replay key is bound to request content and authorization scope, and a mismatch is a
+  typed conflict resolved before payment or replay (§5.2). This prevents a reused key from
+  returning the wrong caller's verdict or charging for a recovery the caller cannot receive.
 - The replay key is a bearer secret; implementations SHOULD keep the window short and
   bounded so the 402 paywall remains effective.
 - Hash projection choice is part of the contract: ambiguous projections (different sets of
@@ -295,3 +380,4 @@ that CAN be signed well-defined.
 | Version | Date       | Changes                                            | Author                          |
 | ------- | ---------- | -------------------------------------------------- | ------------------------------- |
 | 0.1     | 2026-10-18 | Initial draft. Extracted from a live x402 service (verify402.onrender.com, reference implementation open-source) and hardened after independent reproduction of two defects by an external agent (SameDayDesk): recovery-before-settlement and projection mismatch. | a32116150-ctrl (verify402) |
+| 0.2     | 2026-10-19 | Addresses review by NSPG13 (x402-foundation/x402#3848, at `d97ebfa3`). Promotion now keys on a server-generated operation identity plus a confirmed settlement reference, with the projection hash as an additional check (§5.1) — output equality alone no longer identifies an operation. Added key/scope conflict semantics resolved before payment or replay (§5.2), scoped the content companion so equal content is not permission (§3.2, §7), and added a required self-test control set including the identical-output cross-promotion case (§5.4). | a32116150-ctrl (verify402) |
