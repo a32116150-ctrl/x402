@@ -202,8 +202,9 @@ The following are normative consequences:
 2. **Settle-cancellation promotes nothing.** Handler failures and after-verify cancellations
    are the same class.
 3. **Authorization scope is part of the operation.** If the payment rail exposes a payer
-   identity at staging time, promotion MUST refuse a settlement whose payer does not match
-   the recorded scope. An unknown scope may still PAY; it may never replay or promote on
+   identity at staging time, only an identity the rail has **verified** becomes an
+   authorization scope. Promotion MUST refuse a settlement whose payer does not match the
+   recorded verified scope. An unknown scope may still PAY; it may never replay or promote on
    behalf of a known one.
 4. **Staged records are inert and age out silently.** A staged record that is never
    promoted MUST be discarded after `stageTimeoutSeconds` and MUST NOT leave a tombstone:
@@ -250,9 +251,9 @@ slot in a cache, reusing it for a *different* operation is an error, not a hit:
 - If a key arrives with **changed request content** (the canonical request fingerprint
   differs from the one recorded), the server MUST reject the request before payment and
   before replay — it MUST NOT return the other operation's verdict and MUST NOT charge.
-- If the same key arrives under a **different authorization scope** (a different payer
-  identity on a rail that exposes one), the server MUST likewise reject before payment and
-  before replay.
+- If the same key arrives under a **different verified authorization scope** (a different
+  verified payer identity on a rail that exposes one), the server MUST likewise reject
+  before payment and before replay.
 - The rejection SHOULD be a typed `4xx` (the reference implementation uses `409` with
   `error: "recovery_conflict"` and a machine-readable `conflict` field such as
   `request_mismatch` or `scope_mismatch`). A caller that encounters a conflict either
@@ -260,6 +261,16 @@ slot in a cache, reusing it for a *different* operation is an error, not a hit:
 
 A key whose recorded request fingerprint and scope both match the incoming request is
 recoverable exactly as in the first paragraph.
+
+**Scope must be verified before replay.** A caller-supplied payer address is a claim, not
+proof of control. Before an early replay returns a cached result, the server MUST establish
+that the caller controls the recorded verified scope. Acceptable proof is a signature by the
+recorded payer over a server-issued challenge, an authenticated session bound to that payer,
+or an equivalent proof the payment rail already verifies; implementations MUST name the
+mechanism they use. A request that names the correct payer but supplies missing or invalid
+proof MUST NOT receive the cached result: it MAY be rejected, or treated as a fresh paid
+call, but it MUST NOT be treated as a replay. A retry that proves control of the recorded
+scope recovers the settled result without a second payment.
 
 **5.3 After the window (typed, not silent)**
 
@@ -298,13 +309,18 @@ looking but incorrect implementation silently violates:
    promote, even when accompanied by a valid settlement.
 4. **Key + changed content conflicts.** A key recorded for request R1, presented with request
    R2, MUST yield a typed conflict — not R1's verdict, not a charge.
-5. **Key + changed scope conflicts.** A key recorded for payer P1, presented with payer P2,
-   MUST yield a typed conflict.
+5. **Key + changed scope conflicts.** A key recorded for verified payer P1, presented with
+   verified payer P2, MUST yield a typed conflict.
 6. **Payer must match on promotion.** A settlement whose payer differs from the staged scope
    MUST NOT promote.
-7. **Companion requires scope.** A companion alias MUST NOT be returned to a caller with no
-   declared scope, or a mismatched one — equal content alone is never permission — and MUST
-   be returned to a caller whose scope matches.
+7. **Companion requires verified scope.** A companion alias MUST NOT be returned to a caller
+   with no verified scope, or a mismatched one — equal content or a matching declared address
+   alone is never permission — and MUST be returned only to a caller that proves control of
+   the recorded scope.
+8. **Unverified scope does not replay.** A promoted record under verified payer P, retried
+   with P's address but missing or invalid proof of control, MUST NOT return the cached
+   result. A retry that proves control of P's scope MUST recover the settled result without a
+   second payment.
 
 **6. Protocol Integration**
 
@@ -393,3 +409,4 @@ that CAN be signed well-defined.
 | 0.1     | 2026-10-18 | Initial draft. Extracted from a live x402 service (verify402.onrender.com, reference implementation open-source) and hardened after independent reproduction of two defects by an external agent (SameDayDesk): recovery-before-settlement and projection mismatch. | a32116150-ctrl (verify402) |
 | 0.2     | 2026-10-19 | Addresses review by NSPG13 (x402-foundation/x402#3848, at `d97ebfa3`). Promotion now keys on a server-generated operation identity plus a confirmed settlement reference, with the projection hash as an additional check (§5.1) — output equality alone no longer identifies an operation. Added key/scope conflict semantics resolved before payment or replay (§5.2), scoped the content companion so equal content is not permission (§3.2, §7), and added a required self-test control set including the identical-output cross-promotion case (§5.4). | a32116150-ctrl (verify402) |
 | 0.3     | 2026-10-19 | Names both mechanisms that satisfy §5.1 — async stage-then-promote and synchronous write-after-settle — since the choice is determined by whether settlement confirmation can complete before the response is built. Prompted by production corroboration from scvd.store on x402-foundation/x402#3847 (request-identity keying, scope-bound cache keys, no speculative write). | a32116150-ctrl (verify402) |
+| 0.4     | 2026-10-20 | Requires a **verified** payer scope before replay, not merely a declared or matching address. §5.2 names acceptable proof-of-control mechanisms and forbids returning a cached result on missing or invalid proof; §5.4 adds the unverified-scope control. Prompted by NSPG13's review at `2a03ad6` (x402-foundation/x402#3848). | a32116150-ctrl (verify402) |
